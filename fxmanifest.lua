@@ -20,7 +20,8 @@ server_scripts {
 	'locales/sv.lua',
 	'locales/pl.lua',
 	'config.lua',
-	'server/main.lua'
+	'server/main.lua',
+	'server/fn_main.lua',
 }
 
 client_scripts {
