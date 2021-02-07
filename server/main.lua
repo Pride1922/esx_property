@@ -1,5 +1,5 @@
 ESX = nil
-
+local hasSqlRun = false
 TriggerEvent('esx:getSharedObject', function(obj) ESX = obj end)
 
 function GetProperty(name)
@@ -10,7 +10,34 @@ function GetProperty(name)
 	end
 end
 
+
+-- extremely useful when restarting script mid-game
+Citizen.CreateThread(function()
+	Citizen.Wait(5000) -- hopefully enough for connection to the SQL server
+
+	if not hasSqlRun then
+		LoadSql()
+		hasSqlRun = true
+	end
+end)
+
+AddEventHandler('onMySQLReady', function()
+	hasSqlRun = true
+	LoadSql()
+end)
+
+
+ESX.RegisterServerCallback('property:getItemAmount', function(source, cb, item)
+    local xPlayer = ESX.GetPlayerFromId(source)
+    local qtty = xPlayer.getInventoryItem(item).count
+    cb(qtty)
+end)
+
 function SetPropertyOwned(name, price, rented, owner)
+	MySQL.Async.execute('UPDATE properties SET free = 1 WHERE name = @name', {
+		['@name'] = name,
+		['@free']   = 1
+	})
 	MySQL.Async.execute('INSERT INTO owned_properties (name, price, rented, owner) VALUES (@name, @price, @rented, @owner)', {
 		['@name']   = name,
 		['@price']  = price,
@@ -20,53 +47,85 @@ function SetPropertyOwned(name, price, rented, owner)
 		local xPlayer = ESX.GetPlayerFromIdentifier(owner)
 
 		if xPlayer then
-			TriggerClientEvent('esx_property:setPropertyOwned', xPlayer.source, name, true, rented)
+			TriggerClientEvent('esx_property:setBlipOwned', -1, name)
+			Citizen.Wait(100)
+			TriggerClientEvent('esx_property:setPropertyOwned', xPlayer.source, name, true)
 
 			if rented then
-				xPlayer.showNotification(_U('rent_for', ESX.Math.GroupDigits(price)))
+				TriggerClientEvent('esx:showNotification', xPlayer.source, _U('rented_for', ESX.Math.GroupDigits(price)))
 			else
-				xPlayer.showNotification(_U('buy_for', ESX.Math.GroupDigits(price)))
+				--TriggerClientEvent('esx:showNotification', xPlayer.source, _U('purchased_for', ESX.Math.GroupDigits(price)))
+				--TriggerClientEvent('mythic_notify:client:SendAlert', xPlayer.source, { type = 'Success ', text = ('Comprou a propriedade por: €' .. ESX.Math.GroupDigits(price))})
 			end
 		end
 	end)
 end
 
-function RemoveOwnedProperty(name, owner, noPay)
-	MySQL.Async.fetchAll('SELECT id, rented, price FROM owned_properties WHERE name = @name AND owner = @owner', {
+-- function setPropertyLocked(name, source)
+-- 	MySQL.Async.execute('UPDATE properties SET free = 1 WHERE name = @name', {
+-- 		['@name'] = name,
+-- 		['@free']   = 1
+-- 	})
+-- end
+
+function RemoveOwnedProperty1(name, owner)
+	MySQL.Async.execute('DELETE FROM owned_properties WHERE name = @name AND owner = @owner', {
 		['@name']  = name,
 		['@owner'] = owner
-	}, function(result)
-		if result[1] then
-			MySQL.Async.execute('DELETE FROM owned_properties WHERE id = @id', {
-				['@id'] = result[1].id
-			}, function(rowsChanged)
-				local xPlayer = ESX.GetPlayerFromIdentifier(owner)
+	}, function(rowsChanged)
+		local xPlayer = ESX.GetPlayerFromIdentifier(owner)
 
-				if xPlayer then
-					xPlayer.triggerEvent('esx_property:setPropertyOwned', name, false)
-
-					if not noPay then
-						if result[1].rented == 1 then
-							xPlayer.showNotification(_U('moved_out'))
-						else
-							local sellPrice = ESX.Math.Round(result[1].price / Config.SellModifier)
-
-							xPlayer.showNotification(_U('moved_out_sold', ESX.Math.GroupDigits(sellPrice)))
-							xPlayer.addAccountMoney('bank', sellPrice)
-						end
-					end
-				end
-			end)
+		if xPlayer then
+			TriggerClientEvent('esx_property:setPropertyOwned', xPlayer.source, name, false)
+			--TriggerClientEvent('esx:showNotification', xPlayer.source, ('Sprzedałeś mieszkanie'))
 		end
 	end)
 end
 
-MySQL.ready(function()
-	Citizen.Wait(1500)
+function RemoveOwnedProperty(name, owner)
+	MySQL.Async.execute('UPDATE properties SET free = 0 WHERE name = @name', {
+		['@name'] = name,
+		['@free']   = 0
+	})
+	MySQL.Async.fetchAll("SELECT * FROM owned_properties WHERE name = @name AND owner = @owner",{["@name"]=name,["@owner"]=owner},function(data)
+		if data[1]~=nil and data[1]["shared"]~=nil then
+			local xTarget = ESX.GetPlayerFromIdentifier(data[1]["shared"])
+			if xTarget then TriggerClientEvent("esx_property:removeKeys",xTarget.source,name,owner) end
+		end
+	end)
+	MySQL.Async.execute('DELETE FROM owned_properties WHERE name = @name AND owner = @owner', {
+		['@name']  = name,
+		['@owner'] = owner
+	}, function(rowsChanged)
+		local xPlayer = ESX.GetPlayerFromIdentifier(owner)
 
-	MySQL.Async.fetchAll('SELECT * FROM `properties`', {}, function(properties)
+		if xPlayer then
+			local money = 0
+			local result = MySQL.Sync.fetchAll('SELECT * FROM properties WHERE name = @name',
+			{
+				['@name'] = name
+			})
+			if result[1] ~= nil and result[1].price > 0 then
+				--money = tonumber(result[1].price / 2)
+				money = ESX.Math.Round(result[1].price / 2)
+				Citizen.Wait(10)
+				xPlayer.addMoney(money)
+				TriggerClientEvent('mythic_notify:client:SendAlert', xPlayer.source, { type = 'Success ', text = ('Vendeu a propriedade por: €') .. money})
+				--TriggerClientEvent('esx:showNotification', xPlayer.source, ('Sprzedałeś mieszkanie za ~g~' .. money .. '$'))
+			else
+				--TriggerClientEvent('esx:showNotification', xPlayer.source, _U('made_property'))
+				TriggerClientEvent('mythic_notify:client:SendAlert', xPlayer.source, { type = 'Success ', text = _U('made_property')})
+			end
+			TriggerClientEvent('esx_property:setBlipOwned1', -1, name)
+			TriggerClientEvent('esx_property:setPropertyOwned', xPlayer.source, name, false)
+		end
+	end)
+end
 
+function LoadSql()
+	MySQL.Async.fetchAll('SELECT * FROM properties', {}, function(properties)
 		for i=1, #properties, 1 do
+
 			local entering  = nil
 			local exit      = nil
 			local inside    = nil
@@ -74,21 +133,21 @@ MySQL.ready(function()
 			local isSingle  = nil
 			local isRoom    = nil
 			local isGateway = nil
-			local roomMenu  = nil
+      		local roomMenu  = nil
 
-			if properties[i].entering then
+			if properties[i].entering ~= nil then
 				entering = json.decode(properties[i].entering)
 			end
 
-			if properties[i].exit then
+			if properties[i].exit ~= nil then
 				exit = json.decode(properties[i].exit)
 			end
 
-			if properties[i].inside then
+			if properties[i].inside ~= nil then
 				inside = json.decode(properties[i].inside)
 			end
 
-			if properties[i].outside then
+			if properties[i].outside ~= nil then
 				outside = json.decode(properties[i].outside)
 			end
 
@@ -108,9 +167,9 @@ MySQL.ready(function()
 				isGateway = false
 			else
 				isGateway = true
-			end
+      end
 
-			if properties[i].room_menu then
+			if properties[i].room_menu ~= nil then
 				roomMenu = json.decode(properties[i].room_menu)
 			end
 
@@ -127,13 +186,122 @@ MySQL.ready(function()
 				isRoom    = isRoom,
 				isGateway = isGateway,
 				roomMenu  = roomMenu,
+				blip = properties[i].free,
 				price     = properties[i].price
 			})
 		end
 
 		TriggerClientEvent('esx_property:sendProperties', -1, Config.Properties)
 	end)
+end
+
+
+
+RegisterServerEvent('esx_property:requestSell')
+AddEventHandler('esx_property:requestSell', function(playerId, propertyName, ammount)
+	local _source = source
+	TriggerClientEvent('esx_property:sprzedaj', playerId, _source, propertyName, ammount)
 end)
+RegisterServerEvent('esx_property:acceptSell')
+AddEventHandler('esx_property:acceptSell', function(playerId, propertyName, ammount)
+	local _source = source
+	local xPlayer = ESX.GetPlayerFromId(_source)
+	local xPlayer2 = ESX.GetPlayerFromId(playerId)
+	local property = GetProperty(propertyName)
+	if xPlayer.getMoney() >= ammount then
+		xPlayer.removeMoney(ammount)
+		-- TriggerClientEvent('esx:showNotification', -1, ('spejson to pies ' .. ammount))
+		RemoveOwnedProperty1(propertyName, xPlayer2.identifier)
+		Citizen.Wait(1000)
+		-- TriggerClientEvent('esx:showNotification', -1, ('spejson to pies ' .. playerId))
+		SetPropertyOwned(propertyName, property.price, false, xPlayer.identifier)
+		-- setPropertyLocked(propertyName, _source)
+		TriggerClientEvent('mythic_notify:client:SendAlert', _source, { type = 'success ', text = ('Comprou a propriedade! Valor: €') .. ammount})
+		TriggerClientEvent('mythic_notify:client:SendAlert', playerId, { type = 'success ', text = ('Compra aprovada')})
+	else
+		TriggerClientEvent('mythic_notify:client:SendAlert', _source, { type = 'error ', text = ('Não tem dinheiro para comprar a propriedade. Valor: €') .. ammount})
+		--TriggerClientEvent('esx:showNotification', _source, ('Nie masz pieniedzy aby zakupic to mieszkanie'))
+		TriggerClientEvent('mythic_notify:client:SendAlert', playerId, { type = 'error ', text = ('Compra não aprovada')})
+		--TriggerClientEvent('esx:showNotification', playerId, ('Kupiec ostatecznie nie zakupil domu'))
+	end
+	-- print(xPlayer.getMoney())
+	-- TriggerClientEvent('esx:showNotification', -1, ('spejson to pies ' .. xPlayer2.identifier))
+
+end)
+
+ESX.RegisterServerCallback('esx_property:getOwnedProperties4', function(source, cb, propertyName)
+	local xPlayer = ESX.GetPlayerFromId(source)
+	-- print(propertyName)
+
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE name = @name', {
+	['@name'] = propertyName
+	}, function(ownedProperties)
+		-- local properties = {}
+		-- for i=1, #ownedProperties, 1 do
+		-- 	table.insert(properties, ownedProperties[i].name)
+		-- end
+		if ownedProperties[1].shared == xPlayer.identifier then
+			cb(true)
+			-- print('1')
+		else
+			cb(false)
+			-- print('2')
+		end
+		-- cb(properties)
+	end)
+end)
+
+
+
+ESX.RegisterServerCallback('esx_property:getOwnedProperties2', function(source, cb, propertyName)
+	local xPlayer = ESX.GetPlayerFromId(source)
+
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE name = @name', {
+	['@name'] = propertyName
+	}, function(ownedProperties)
+		if ownedProperties[1] ~= nil then
+			if ownedProperties[1].shared == xPlayer.identifier then
+				cb(true)
+				return
+			else
+				cb(false)
+				return
+			end
+		else
+			cb(false)
+		end
+		-- cb(properties)
+	end)
+end)
+
+
+ESX.RegisterServerCallback('esx_property:getOwnedProperties6', function(source, cb, propertyName)
+	local xPlayer = ESX.GetPlayerFromId(source)
+
+	MySQL.Async.fetchAll('SELECT * FROM properties WHERE name = @name', {
+	['@name'] = propertyName
+	}, function(ownedProperties)
+		if ownedProperties[1].free == 1 then
+			cb(true)
+		else
+			cb(false)
+		end
+	end)
+end)
+
+
+ESX.RegisterServerCallback('esx_property:getOwnedProperties3', function(source, cb, propertyName)
+	local xPlayer = ESX.GetPlayerFromId(source)
+
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE name = @name', {
+	['@name'] = propertyName
+	}, function(ownedProperties)
+		cb(ownedProperties[1].owner)
+	end)
+end)
+
+
+
 
 ESX.RegisterServerCallback('esx_property:getProperties', function(source, cb)
 	cb(Config.Properties)
@@ -166,29 +334,31 @@ AddEventHandler('esx_property:removeOwnedProperty', function(name, owner)
 	RemoveOwnedProperty(name, owner)
 end)
 
-RegisterNetEvent('esx_property:rentProperty')
+RegisterServerEvent('esx_property:rentProperty')
 AddEventHandler('esx_property:rentProperty', function(propertyName)
 	local xPlayer  = ESX.GetPlayerFromId(source)
 	local property = GetProperty(propertyName)
-	local rent     = ESX.Math.Round(property.price / Config.RentModifier)
+	local rent     = ESX.Math.Round(property.price / 200)
 
 	SetPropertyOwned(propertyName, rent, true, xPlayer.identifier)
 end)
 
-RegisterNetEvent('esx_property:buyProperty')
+RegisterServerEvent('esx_property:buyProperty')
 AddEventHandler('esx_property:buyProperty', function(propertyName)
 	local xPlayer  = ESX.GetPlayerFromId(source)
 	local property = GetProperty(propertyName)
 
 	if property.price <= xPlayer.getMoney() then
+		TriggerClientEvent('mythic_notify:client:SendAlert', xPlayer.source, { type = 'Success ', text = ('Comprou a propriedade por: €') .. property.price})
 		xPlayer.removeMoney(property.price)
 		SetPropertyOwned(propertyName, property.price, false, xPlayer.identifier)
 	else
-		xPlayer.showNotification(_U('not_enough'))
+		--TriggerClientEvent('esx:showNotification', source, _U('not_enough'))
+		TriggerClientEvent('mythic_notify:client:SendAlert', xPlayer.source, { type = 'error ', text = _U('not_enough')})
 	end
 end)
 
-RegisterNetEvent('esx_property:removeOwnedProperty')
+RegisterServerEvent('esx_property:removeOwnedProperty')
 AddEventHandler('esx_property:removeOwnedProperty', function(propertyName)
 	local xPlayer = ESX.GetPlayerFromId(source)
 	RemoveOwnedProperty(propertyName, xPlayer.identifier)
@@ -198,7 +368,7 @@ AddEventHandler('esx_property:removeOwnedPropertyIdentifier', function(propertyN
 	RemoveOwnedProperty(propertyName, identifier)
 end)
 
-RegisterNetEvent('esx_property:saveLastProperty')
+RegisterServerEvent('esx_property:saveLastProperty')
 AddEventHandler('esx_property:saveLastProperty', function(property)
 	local xPlayer = ESX.GetPlayerFromId(source)
 
@@ -208,7 +378,7 @@ AddEventHandler('esx_property:saveLastProperty', function(property)
 	})
 end)
 
-RegisterNetEvent('esx_property:deleteLastProperty')
+RegisterServerEvent('esx_property:deleteLastProperty')
 AddEventHandler('esx_property:deleteLastProperty', function()
 	local xPlayer = ESX.GetPlayerFromId(source)
 
@@ -217,39 +387,91 @@ AddEventHandler('esx_property:deleteLastProperty', function()
 	})
 end)
 
-RegisterNetEvent('esx_property:getItem')
+function DiscordHook(hook,message,color)
+    local hooke = 'https://discordapp.com/api/webhooks/626447166398922752/FU0j-GpXP36OjrpFy1VZIBk9iHihNhnWDK2vfAMMeNhMm_okQnA9GEr70xI5lqKqwrpN'
+    local embeds = {
+                {
+            ["title"] = message,
+            ["type"] = "rich",
+            ["color"] = color,
+            ["footer"] = {
+				["text"] = 'GoldenGateRP'
+                    },
+                }
+            }
+    if message == nil or message == '' then return FALSE end
+    PerformHttpRequest(hooke, function(err, text, headers) end, 'POST', json.encode({ username = hook,embeds = embeds}), { ['Content-Type'] = 'application/json' })
+end
+
+function DiscordHookwkladanie(hook,message,color)
+    local hooke = 'https://discordapp.com/api/webhooks/626447032432721930/d88RcCq1LyjzBPZHN84FQQ3K9ATo0Obuy6MKyjsjS5fF2ykag-4luMCpOMlTZfuIzKe1'
+    local embeds = {
+                {
+            ["title"] = message,
+            ["type"] = "rich",
+            ["color"] = color,
+            ["footer"] = {
+				["text"] = 'GoldenGateRP'
+                    },
+                }
+            }
+    if message == nil or message == '' then return FALSE end
+    PerformHttpRequest(hooke, function(err, text, headers) end, 'POST', json.encode({ username = hook,embeds = embeds}), { ['Content-Type'] = 'application/json' })
+end
+
+
+RegisterServerEvent('esx_property:getItem')
 AddEventHandler('esx_property:getItem', function(owner, type, item, count)
-	local xPlayer = ESX.GetPlayerFromId(source)
+	local _source      = source
+	local xPlayer      = ESX.GetPlayerFromId(_source)
 	local xPlayerOwner = ESX.GetPlayerFromIdentifier(owner)
 
 	if type == 'item_standard' then
+
+		local sourceItem = xPlayer.getInventoryItem(item)
+
 		TriggerEvent('esx_addoninventory:getInventory', 'property', xPlayerOwner.identifier, function(inventory)
 			local inventoryItem = inventory.getItem(item)
 
 			-- is there enough in the property?
 			if count > 0 and inventoryItem.count >= count then
+			
 				-- can the player carry the said amount of x item?
 				if xPlayer.canCarryItem(item, count) then
 					inventory.removeItem(item, count)
 					xPlayer.addInventoryItem(item, count)
-					xPlayer.showNotification(_U('have_withdrawn', count, inventoryItem.label))
+					TriggerClientEvent('esx:showNotification', _source, _U('have_withdrawn', count, inventoryItem.label))
+					local xPlayer = ESX.GetPlayerFromId(source)
+
+					local steamid = xPlayer.identifier
+					local name = GetPlayerName(source)
+				
+					wiadomosc = name.." WYJĄŁ Z SZAFKI \n[PRZEDMIOT: "..item.." | ILOSC: x"..count.."] \n[ID: "..source.." | Nazwa: "..name.." | SteamID: "..steamid.." ]" 
+					DiscordHook('GoldenGateRP', wiadomosc, 11750815)
+					
 				else
-					xPlayer.showNotification(_U('player_cannot_hold'))
+					TriggerClientEvent('esx:showNotification', _source, _U('player_cannot_hold'))
 				end
 			else
-				xPlayer.showNotification(_U('not_enough_in_property'))
+				TriggerClientEvent('esx:showNotification', _source, _U('not_enough_in_property'))
 			end
 		end)
+
 	elseif type == 'item_account' then
+
 		TriggerEvent('esx_addonaccount:getAccount', 'property_' .. item, xPlayerOwner.identifier, function(account)
-			if account.money >= count then
+			local roomAccountMoney = account.money
+
+			if roomAccountMoney >= count then
 				account.removeMoney(count)
 				xPlayer.addAccountMoney(item, count)
 			else
-				xPlayer.showNotification(_U('amount_invalid'))
+				TriggerClientEvent('esx:showNotification', _source, _U('amount_invalid'))
 			end
 		end)
+
 	elseif type == 'item_weapon' then
+
 		TriggerEvent('esx_datastore:getDataStore', 'property', xPlayerOwner.identifier, function(store)
 			local storeWeapons = store.get('weapons') or {}
 			local weaponName   = nil
@@ -267,62 +489,97 @@ AddEventHandler('esx_property:getItem', function(owner, type, item, count)
 
 			store.set('weapons', storeWeapons)
 			xPlayer.addWeapon(weaponName, ammo)
+			local xPlayer = ESX.GetPlayerFromId(source)
+
+					local steamid = xPlayer.identifier
+					local name = GetPlayerName(source)
+				
+					wiadomosc = name.." WYJĄŁ Z SZAFKI \n[BRON: "..item.." | AMMO: x"..count.."] \n[ID: "..source.." | Nazwa: "..name.." | SteamID: "..steamid.." ]" 
+					DiscordHook('GoldenGateRP', wiadomosc, 11750815)
 		end)
+
 	end
 end)
 
-RegisterNetEvent('esx_property:putItem')
+RegisterServerEvent('esx_property:putItem')
 AddEventHandler('esx_property:putItem', function(owner, type, item, count)
-	local xPlayer = ESX.GetPlayerFromId(source)
+	local _source      = source
+	local xPlayer      = ESX.GetPlayerFromId(_source)
 	local xPlayerOwner = ESX.GetPlayerFromIdentifier(owner)
 
 	if type == 'item_standard' then
+
 		local playerItemCount = xPlayer.getInventoryItem(item).count
 
 		if playerItemCount >= count and count > 0 then
 			TriggerEvent('esx_addoninventory:getInventory', 'property', xPlayerOwner.identifier, function(inventory)
 				xPlayer.removeInventoryItem(item, count)
 				inventory.addItem(item, count)
-				xPlayer.showNotification(_U('have_deposited', count, inventory.getItem(item).label))
+				TriggerClientEvent('esx:showNotification', _source, _U('have_deposited', count, inventory.getItem(item).label))
+				--TriggerClientEvent('esx:showNotification', _source, _U('have_deposited', count, inventory.getItem(item).label))
+				local xPlayer = ESX.GetPlayerFromId(source)
+
+					local steamid = xPlayer.identifier
+					local name = GetPlayerName(source)
+				
+					wiadomosc = name.." WSADZIŁ DO SZAFKI \n[PRZEDMIOT: "..item.." | ILOSC: x"..count.."] \n[ID: "..source.." | Nazwa: "..name.." | SteamID: "..steamid.." ]" 
+					DiscordHookwkladanie('GoldenGateRP', wiadomosc, 11750815)
 			end)
 		else
-			xPlayer.showNotification(_U('invalid_quantity'))
+			TriggerClientEvent('esx:showNotification', _source, _U('invalid_quantity'))
 		end
+
 	elseif type == 'item_account' then
-		if xPlayer.getAccount(item).money >= count and count > 0 then
+
+		local playerAccountMoney = xPlayer.getAccount(item).money
+
+		if playerAccountMoney >= count and count > 0 then
 			xPlayer.removeAccountMoney(item, count)
 
 			TriggerEvent('esx_addonaccount:getAccount', 'property_' .. item, xPlayerOwner.identifier, function(account)
 				account.addMoney(count)
 			end)
 		else
-			xPlayer.showNotification(_U('amount_invalid'))
+			TriggerClientEvent('esx:showNotification', _source, _U('amount_invalid'))
 		end
+
 	elseif type == 'item_weapon' then
-		if xPlayer.hasWeapon(item) then
+
+		TriggerEvent('esx_datastore:getDataStore', 'property', xPlayerOwner.identifier, function(store)
+			local storeWeapons = store.get('weapons') or {}
+
+			table.insert(storeWeapons, {
+				name = item,
+				ammo = count
+			})
+
+			store.set('weapons', storeWeapons)
 			xPlayer.removeWeapon(item)
+			local xPlayer = ESX.GetPlayerFromId(source)
 
-			TriggerEvent('esx_datastore:getDataStore', 'property', xPlayerOwner.identifier, function(store)
-				local storeWeapons = store.get('weapons') or {}
+			local steamid = xPlayer.identifier
+			local name = GetPlayerName(source)
+		
+			wiadomosc = name.." WSADZIŁ DO SZAFKI \n[BRON: "..item.." | AMMO: x"..count.."] \n[ID: "..source.." | Nazwa: "..name.." | SteamID: "..steamid.." ]" 
+			DiscordHookwkladanie('GoldenGateRP', wiadomosc, 11750815)
+		end)
 
-				table.insert(storeWeapons, {
-					name = item,
-					ammo = count
-				})
-
-				store.set('weapons', storeWeapons)
-			end)
-		end
 	end
 end)
 
 ESX.RegisterServerCallback('esx_property:getOwnedProperties', function(source, cb)
 	local xPlayer = ESX.GetPlayerFromId(source)
 
-	MySQL.Async.fetchAll('SELECT name, rented FROM owned_properties WHERE owner = @owner', {
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE owner = @owner', {
 		['@owner'] = xPlayer.identifier
-	}, function(result)
-		cb(result)
+	}, function(ownedProperties)
+		local properties = {}
+
+		for i=1, #ownedProperties, 1 do
+			table.insert(properties, ownedProperties[i].name)
+		end
+
+		cb(properties)
 	end)
 end)
 
@@ -336,14 +593,19 @@ ESX.RegisterServerCallback('esx_property:getLastProperty', function(source, cb)
 	end)
 end)
 
-ESX.RegisterServerCallback('esx_property:getPropertyInventory', function(source, cb, owner)
+ESX.RegisterServerCallback('esx_property:getPropertyInventory', function(source, cb, owner, propertyName)
 	local xPlayer    = ESX.GetPlayerFromIdentifier(owner)
 	local blackMoney = 0
+	local money = 0
 	local items      = {}
 	local weapons    = {}
 
 	TriggerEvent('esx_addonaccount:getAccount', 'property_black_money', xPlayer.identifier, function(account)
 		blackMoney = account.money
+	end)
+
+	TriggerEvent('esx_addonaccount:getAccount', 'property_money', xPlayer.identifier, function(account)
+		money = account.money
 	end)
 
 	TriggerEvent('esx_addoninventory:getInventory', 'property', xPlayer.identifier, function(inventory)
@@ -357,12 +619,59 @@ ESX.RegisterServerCallback('esx_property:getPropertyInventory', function(source,
 	cb({
 		blackMoney = blackMoney,
 		items      = items,
+		money = money,
 		weapons    = weapons
 	})
 end)
+	--[[local _source = source
+	local xPlayer2 = ESX.GetPlayerFromId(_source)
+	local xPlayer    = ESX.GetPlayerFromIdentifier(owner)
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE name = @name', {
+		['@name'] = propertyName
+		}, function(ownedProperties)
+			if ownedProperties[1].search ~= nil then
+				cb(false)
+			else
+				local blackMoney = 0
+				local items      = {}
+				local weapons    = {}
+				-- cb(false)
+				-- return
+				TriggerEvent('esx_addonaccount:getAccount', 'property_black_money', xPlayer.identifier, function(account)
+					blackMoney = account.money
+				end)
+			
+				TriggerEvent('esx_addoninventory:getInventory', 'property', xPlayer.identifier, function(inventory)
+					items = inventory.items
+				end)
+			
+				TriggerEvent('esx_datastore:getDataStore', 'property', xPlayer.identifier, function(store)
+					weapons = store.get('weapons') or {}
+				end)
+			
+				cb({
+					blackMoney = blackMoney,
+					items      = items,
+					weapons    = weapons
+				})
+				-- print('opcja 1')
+			end
+		end)
+end)]]--
 
 ESX.RegisterServerCallback('esx_property:getPlayerInventory', function(source, cb)
 	local xPlayer    = ESX.GetPlayerFromId(source)
+	local blackMoney = xPlayer.getAccount('black_money').money
+	local money = xPlayer.getAccount('money').money
+	local items      = xPlayer.inventory
+
+	cb({
+		blackMoney = blackMoney,
+		items      = items,
+		money = money,
+		weapons    = xPlayer.getLoadout()
+	})
+	--[[local xPlayer    = ESX.GetPlayerFromId(source)
 	local blackMoney = xPlayer.getAccount('black_money').money
 	local items      = xPlayer.inventory
 
@@ -370,7 +679,7 @@ ESX.RegisterServerCallback('esx_property:getPlayerInventory', function(source, c
 		blackMoney = blackMoney,
 		items      = items,
 		weapons    = xPlayer.getLoadout()
-	})
+	})]]--
 end)
 
 ESX.RegisterServerCallback('esx_property:getPlayerDressing', function(source, cb)
@@ -398,7 +707,7 @@ ESX.RegisterServerCallback('esx_property:getPlayerOutfit', function(source, cb, 
 	end)
 end)
 
-RegisterNetEvent('esx_property:removeOutfit')
+RegisterServerEvent('esx_property:removeOutfit')
 AddEventHandler('esx_property:removeOutfit', function(label)
 	local xPlayer = ESX.GetPlayerFromId(source)
 
@@ -410,59 +719,27 @@ AddEventHandler('esx_property:removeOutfit', function(label)
 	end)
 end)
 
-function payRent(d, h, m)
-	local tasks, timeStart = {}, os.clock()
-	print('[esx_property] [^2INFO^7] Paying rent cron job started')
+function PayRent(d, h, m)
+	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE rented = 1', {}, function (result)
+		for i=1, #result, 1 do
+			local xPlayer = ESX.GetPlayerFromIdentifier(result[i].owner)
 
-	MySQL.Async.fetchAll('SELECT * FROM owned_properties WHERE rented = 1', {}, function(result)
-		for k,v in ipairs(result) do
-			table.insert(tasks, function(cb)
-				local xPlayer = ESX.GetPlayerFromIdentifier(v.owner)
+			-- message player if connected
+			if xPlayer then
+				xPlayer.removeAccountMoney('bank', result[i].price)
+				TriggerClientEvent('esx:showNotification', xPlayer.source, _U('paid_rent', ESX.Math.GroupDigits(result[i].price)))
+			else -- pay rent either way
+				MySQL.Sync.execute('UPDATE users SET bank = bank - @bank WHERE identifier = @identifier', {
+					['@bank']       = result[i].price,
+					['@identifier'] = result[i].owner
+				})
+			end
 
-				if xPlayer then
-					if xPlayer.getAccount('bank').money >= v.price then
-						xPlayer.removeAccountMoney('bank', v.price)
-						xPlayer.showNotification(_U('paid_rent', ESX.Math.GroupDigits(v.price), GetProperty(v.name).label))
-					else
-						xPlayer.showNotification(_U('paid_rent_evicted', GetProperty(v.name).label, ESX.Math.GroupDigits(v.price)))
-						RemoveOwnedProperty(v.name, v.owner, true)
-					end
-				else
-					MySQL.Async.fetchScalar('SELECT accounts FROM users WHERE identifier = @identifier', {
-						['@identifier'] = v.owner
-					}, function(accounts)
-						if accounts then
-							local playerAccounts = json.decode(accounts)
-
-							if playerAccounts and playerAccounts.bank then
-								if playerAccounts.bank >= v.price then
-									playerAccounts.bank = playerAccounts.bank - v.price
-
-									MySQL.Async.execute('UPDATE users SET accounts = @accounts WHERE identifier = @identifier', {
-										['@identifier'] = v.owner,
-										['@accounts'] = json.encode(playerAccounts)
-									})
-								else
-									RemoveOwnedProperty(v.name, v.owner, true)
-								end
-							end
-						end
-					end)
-				end
-
-				TriggerEvent('esx_addonaccount:getSharedAccount', 'society_realestateagent', function(account)
-					account.addMoney(v.price)
-				end)
-
-				cb()
+			TriggerEvent('esx_addonaccount:getSharedAccount', 'society_realestateagent', function(account)
+				account.addMoney(result[i].price)
 			end)
 		end
-
-		Async.parallelLimit(tasks, 5, function(results) end)
-
-		local elapsedTime = os.clock() - timeStart
-		print(('[esx_property] [^2INFO^7] Paying rent cron job took %s seconds'):format(elapsedTime))
 	end)
 end
 
-TriggerEvent('cron:runAt', 22, 0, payRent)
+TriggerEvent('cron:runAt', 22, 0, PayRent)
